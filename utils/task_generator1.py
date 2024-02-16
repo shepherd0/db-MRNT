@@ -1,0 +1,243 @@
+# code is based on https://github.com/katerakelly/pytorch-maml
+import torch
+import random
+import os
+from torch.utils.data import DataLoader, Dataset
+import torchvision.transforms as transforms
+from PIL import Image
+import numpy as np
+
+
+# -----------------------------------
+# Method: split_fine_grained_dataset
+# Description: split fine grained dataset like CUB,Stanford Car and FGVC-aircraft into
+#              two folders: metatrain_folders and metatest_folders
+# -----------------------------------
+def split_fine_grained_dataset(dataset_path, num_train, num_test):
+    data_folder = [os.path.join(dataset_path, class_name) \
+                   for class_name in os.listdir(dataset_path) \
+                   if os.path.isdir(os.path.join(dataset_path, class_name)) \
+                   ]
+    random.seed(1)
+    random.shuffle(data_folder)
+
+    metatrain_folder = data_folder[:num_train]
+    metatest_folder = data_folder[num_train:num_train + num_test]
+
+    return metatrain_folder, metatest_folder
+
+
+# -----------------------------
+# Method: mini_imagenet_folders
+# Description: Since we already have split miniimagenet folders, here we only have to
+#              shuffle them and return metatrain_folders and metatest_folders
+# -----------------------------
+def mini_imagenet_folder(train_folder, val_folder, test_folder):
+    metatrain_folder = [os.path.join(train_folder, label) \
+                        for label in os.listdir(train_folder) \
+                        if os.path.isdir(os.path.join(train_folder, label)) \
+                        ]
+    metaval_folder = [os.path.join(val_folder, label) \
+                       for label in os.listdir(val_folder) \
+                       if os.path.isdir(os.path.join(val_folder, label)) \
+                       ]
+    metatest_folder = [os.path.join(test_folder, label) \
+                       for label in os.listdir(test_folder) \
+                       if os.path.isdir(os.path.join(test_folder, label)) \
+                       ]
+
+    random.seed(1)
+    random.shuffle(metatrain_folder)
+    random.shuffle(metaval_folder)
+    random.shuffle(metatest_folder)
+
+    return metatrain_folder, metaval_folder, metatest_folder
+
+
+# -----------------------
+# Class: FewShotTask
+# Description: Generate a C way K shot Few-Shot Learning task from data_folders (metatrain_folders or metatset_folders)
+#              including data_roots and data_labels
+# -----------------------
+class FewShotTask(object):
+
+    def __init__(self, data_folder, num_class, num_train, num_test, type="meta_train"):
+        self.data_folder = data_folder
+        self.num_class = num_class
+        self.num_train = num_train
+        self.num_test = num_test
+        self.type = type
+
+        global_labels = np.array(range(len(self.data_folder)))
+        global_labels = dict(zip(self.data_folder, global_labels))
+
+        class_folders = random.sample(self.data_folder, self.num_class)
+        labels = np.array(range(len(class_folders)))
+        labels = dict(zip(class_folders, labels))
+        samples = dict()
+
+        self.train_roots = []
+        self.test_roots = []
+        for c in class_folders:
+            temp = [os.path.join(c, x) for x in os.listdir(c)]
+            samples[c] = random.sample(temp, len(temp))
+
+            self.train_roots += samples[c][:num_train]
+            self.test_roots += samples[c][num_train:num_train + num_test]
+
+        self.train_labels = [labels[self.get_class(x)] for x in self.train_roots]
+        self.test_labels = [labels[self.get_class(x)] for x in self.test_roots]
+        self.train_global_labels = [global_labels[self.get_class(x)] for x in self.train_roots]
+        self.test_global_labels = [global_labels[self.get_class(x)] for x in self.test_roots]
+
+    def get_class(self, sample):
+        return os.path.join(*sample.split('\\')[:-1])
+
+
+# -------------------------
+# Class: FewShotDataset
+# Description: Generate a pytorch dataset for training based on the input task.
+# -------------------------
+class FewShotDataset(Dataset):
+
+    def __init__(self, task, split='train', transform=None, target_transform=None):
+        self.transform = transform  # Torch operations on the input image
+        self.target_transform = target_transform
+        self.task = task
+        self.split = split
+        self.image_roots = self.task.train_roots if self.split == 'train' else self.task.test_roots
+        self.labels = self.task.train_labels if self.split == 'train' else self.task.test_labels
+        self.global_labels = self.task.train_global_labels if self.split == 'train' else self.task.test_global_labels
+
+    def __len__(self):
+        return len(self.image_roots)
+
+    def __getitem__(self, idx):
+        image_root = self.image_roots[idx]
+        image = Image.open(image_root)
+        image = image.convert('RGB')
+        if self.transform is not None:
+            image = self.transform(image)
+        label = self.labels[idx]
+        global_label = self.global_labels[idx]
+        if self.target_transform is not None:
+            label = self.target_transform(label)
+        return image, label, global_label
+
+
+# -------------------------
+# Class: TaskGenerator
+# Description: 1) to sample task (a ready-to-use task dataset) for training
+#              2) generate a classification dataset for embedding pretraining
+# -------------------------
+class TaskGenerator():
+
+    def __init__(self, metatrain_folder, metaval_folder, metatest_folder):
+        super(TaskGenerator, self).__init__()
+        self.metatrain_folder = metatrain_folder
+        self.metatest_folder = metatest_folder
+        self.metaval_folder = metaval_folder
+
+    def sample_task(self, num_class, num_support, num_query, type="meta_train"):
+
+        if type == "meta_train":
+            task = FewShotTask(self.metatrain_folder, num_class, num_support, num_query, type=type)
+        elif type == "meta_val":
+            task = FewShotTask(self.metaval_folder, num_class, num_support, num_query, type=type)
+        else:
+            task = FewShotTask(self.metatest_folder, num_class, num_support, num_query, type=type)
+        support_dataloader = self.get_data_loader(task, split="train", shuffle=False)
+        query_dataloader = self.get_data_loader(task, split="test", shuffle=True)
+        # sample datas
+
+        support_x, support_y, _ = support_dataloader.__iter__().next()  # sample once to obtain all data
+        query_x, query_y, _ = query_dataloader.__iter__().next()
+
+        return support_x, support_y, query_x, query_y
+
+    def get_data_loader(self, task, split='train', shuffle=False):
+
+        transform = transforms.Compose([
+            transforms.ToTensor(),
+            # transforms.Normalize(mean=[0.92206, 0.92206, 0.92206], std=[0.08426, 0.08426, 0.08426])
+            # transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+            # transforms.Normalize(mean=[0.476, 0.451, 0.391], std=[0.261, 0.256, 0.260])
+            transforms.Normalize(mean=[0.476, 0.451, 0.391], std=[0.261, 0.256, 0.260])
+            # transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+            # transforms.Normalize(mean=[0.470, 0.459, 0.454], std=[0.293, 0.292, 0.300])
+            # cars normMean = [0.4695236, 0.45908082, 0.45408717]
+            # cars normStd = [0.29290766, 0.29179975, 0.3000209]
+            # dog normMean = [0.4756883, 0.4513754, 0.39057145]
+            # dog normStd = [0.2613739, 0.25582975, 0.26048604]
+            # cub normMean = [0.47821182, 0.49393576, 0.42665997]
+            # cub normStd = [0.22556107, 0.22121406, 0.25943705]
+        ])
+        transform_argument = transforms.Compose([
+            transforms.RandomCrop(84, padding=8),
+            transforms.RandomHorizontalFlip(),
+            transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4),
+            transform,
+            transforms.RandomErasing(0.5)
+        ])
+
+        if task.type == "meta_train":
+            if split == 'train':
+                dataset = FewShotDataset(task, split=split, transform=transform_argument)
+                batch_size = task.num_train * task.num_class
+                loader = DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=0,
+                                    pin_memory=torch.cuda.is_available())
+
+            else:
+                dataset = FewShotDataset(task, split=split, transform=transform_argument)
+                batch_size = task.num_test * task.num_class
+                loader = DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=0,
+                                    pin_memory=torch.cuda.is_available())
+
+        else:
+            if split == 'train':
+                dataset = FewShotDataset(task, split=split, transform=transform)
+                batch_size = task.num_train * task.num_class
+                loader = DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=0,
+                                    pin_memory=torch.cuda.is_available())
+            else:
+                dataset = FewShotDataset(task, split=split, transform=transform)
+                batch_size = task.num_test * task.num_class
+                loader = DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=0,
+                                    pin_memory=torch.cuda.is_available())
+
+        return loader
+
+    def get_classifier_dataset(self, batch_size, num_class, num_train, num_test):
+
+        transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.92206, 0.92206, 0.92206], std=[0.08426, 0.08426, 0.08426])
+            # transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+
+        ])
+
+        train_transform = transforms.Compose([
+            transforms.RandomHorizontalFlip(),
+            transform
+        ])
+
+        test_transform = transforms.Compose([
+            transform
+        ])
+
+        task = FewShotTask(self.metatrain_folder, num_class, num_train, num_test)
+        train_dataset = FewShotDataset(task, split="train", transform=train_transform)
+        train_dataloader = torch.utils.data.DataLoader(train_dataset,
+                                                       batch_size=batch_size,
+                                                       shuffle=True,
+                                                       num_workers=0,
+                                                       pin_memory=torch.cuda.is_available())
+
+        test_dataset = FewShotDataset(task, split="test", transform=test_transform)
+        test_dataloader = torch.utils.data.DataLoader(test_dataset,
+                                                      batch_size=batch_size,
+                                                      shuffle=True,
+                                                      num_workers=0,
+                                                      pin_memory=torch.cuda.is_available())
+
+        return train_dataloader, test_dataloader
